@@ -1,0 +1,37 @@
+{
+  "name": "@cm64/obscom",
+  "version": "0.1.0",
+  "description": "OBS from the terminal, built for AI agents. Zero-dependency obs-websocket v5 CLI with --json everywhere and screenshots of the program output.",
+  "type": "commonjs",
+  "bin": {
+    "obscom": "obscom"
+  },
+  "files": [
+    "obscom",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/andycufari/obscom.git"
+  },
+  "homepage": "https://github.com/andycufari/obscom#readme",
+  "bugs": {
+    "url": "https://github.com/andycufari/obscom/issues"
+  },
+  "keywords": [
+    "obs",
+    "obs-studio",
+    "obs-websocket",
+    "cli",
+    "streaming",
+    "ai-agents",
+    "claude-code"
+  ],
+  "author": "CM64 Labs",
+  "license": "MIT"
+}
