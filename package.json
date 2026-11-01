@@ -1,7 +1,7 @@
 {
   "name": "@cm64/obscom",
-  "version": "0.1.0",
-  "description": "OBS from the terminal, built for AI agents. Zero-dependency obs-websocket v5 CLI with --json everywhere and screenshots of the program output.",
+  "version": "0.2.0",
+  "description": "OBS from the terminal, built for AI agents. Zero-dependency obs-websocket v5 CLI: atomic macros, --json everywhere, event watching and screenshots of the program output.",
   "type": "commonjs",
   "bin": {
     "obscom": "obscom"
@@ -13,7 +13,7 @@
     "LICENSE"
   ],
   "engines": {
-    "node": ">=22"
+    "node": ">=18"
   },
   "repository": {
     "type": "git",
@@ -28,6 +28,7 @@
     "obs-studio",
     "obs-websocket",
     "cli",
+    "macros",
     "streaming",
     "ai-agents",
     "claude-code"
