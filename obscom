@@ -1,15 +1,16 @@
 #!/usr/bin/env node
 // obscom — OBS from the terminal, built for AI agents. Talks obs-websocket v5.
-// Zero dependencies: needs Node >= 22 (global WebSocket). Run `obscom help`.
+// Zero dependencies. Ships its own tiny WebSocket client (node:net) because loading
+// Node's global WebSocket costs ~40 ms per call. Run `obscom help`.
 'use strict';
 
 const crypto = require('node:crypto');
 const fs = require('node:fs');
+const net = require('node:net');
 const os = require('node:os');
 const path = require('node:path');
-const { execFileSync } = require('node:child_process');
 
-const VERSION = '0.1.0';
+const VERSION = '0.2.0';
 const TIMEOUT_MS = 10000;
 
 function configPath() {
@@ -25,7 +26,7 @@ function configPath() {
 
 const HELP = `obscom ${VERSION} — OBS from the terminal, built for AI agents (obs-websocket v5)
 
-  obscom status                      is OBS up? scene, stream, recording, mic
+  obscom status [--short]            is OBS up? scene, stream, recording, mic
   obscom scenes                      list scenes (* = current program scene)
   obscom scene "<name>"              switch program scene
   obscom sources [scene]             list sources in a scene (default: current)
@@ -39,19 +40,28 @@ const HELP = `obscom ${VERSION} — OBS from the terminal, built for AI agents (
   obscom stream [start|stop] --yes   stream status / start / stop (needs --yes)
   obscom screenshot [source|scene] [--out file.png] [--width N]
                                      save a PNG (default: program output), print its path
+  obscom run <macro> [args...]       run a macro as one atomic batch (--dry-run to preview)
+  obscom macros                      list macros, one per line
+  obscom watch [--json] [--all]      print OBS events as they happen, one per line
   obscom raw <RequestType> ['<json>']
                                      send any obs-websocket request
 
 Flags
   --json                 machine-readable output on every command
+  -q, --quiet            print nothing on success (errors still go to stderr)
   --yes, --si            confirm stream start/stop (it goes public)
+  --dry-run              run: resolve names and print the plan, send nothing
+  --macros <file>        macros file (env: OBSCOM_MACROS)
   --host, --port, --password   connection (env: OBS_HOST, OBS_PORT, OBS_PASSWORD)
 
 Default mic: $OBS_MIC, else the audio input capture in the current scene,
 else OBS's global Mic/Aux.
 
+Macros file: --macros, then $OBSCOM_MACROS, then the first that exists of
+  ${['./obscom.json', ...defaultMacroPaths().slice(1)].join('\n  ')}
+
 Spanish aliases: estado, escenas, escena, fuentes, mostrar, ocultar, volumen,
-texto, grabar, captura.
+texto, grabar, captura, correr.
 
 Password lookup: --password, then OBS_PASSWORD, then
   ${configPath()}`;
@@ -61,16 +71,19 @@ class CliError extends Error {}
 // ---------- args ----------
 
 function parseArgs(argv) {
-  const flags = { json: false, yes: false, out: null, width: null, host: null, port: null, password: null };
+  const flags = { json: false, yes: false, quiet: false, short: false, dryRun: false, all: false,
+    out: null, width: null, host: null, port: null, password: null, macros: null };
   const pos = [];
   const valued = { '--out': 'out', '-o': 'out', '--width': 'width', '--ancho': 'width',
-    '--host': 'host', '--port': 'port', '--password': 'password' };
+    '--host': 'host', '--port': 'port', '--password': 'password', '--macros': 'macros' };
+  const bool = { '--json': 'json', '--yes': 'yes', '-y': 'yes', '--si': 'yes', '--sí': 'yes',
+    '-q': 'quiet', '--quiet': 'quiet', '--short': 'short', '-s': 'short', '--dry-run': 'dryRun',
+    '-n': 'dryRun', '--all': 'all' };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     const eq = a.indexOf('=');
     const key = a.startsWith('--') && eq > 0 ? a.slice(0, eq) : a;
-    if (a === '--json') flags.json = true;
-    else if (a === '--yes' || a === '-y' || a === '--si' || a === '--sí') flags.yes = true;
+    if (bool[a]) flags[bool[a]] = true;
     else if (a === '-h' || a === '--help') pos.unshift('help');
     else if (a === '-v' || a === '--version') pos.unshift('version');
     else if (valued[key]) {
@@ -83,14 +96,134 @@ function parseArgs(argv) {
   return { flags, pos };
 }
 
+// ---------- websocket (RFC 6455, client side, just what obs-websocket needs) ----------
+
+const WS_GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
+
+function openSocket(host, port, protocol, on) {
+  const key = crypto.randomBytes(16).toString('base64');
+  const sock = net.connect({ host, port });
+  sock.setNoDelay(true);
+  let head = Buffer.alloc(0);
+  let upgraded = false;
+  let closing = false;
+  let done = false;
+  let closeCode = 1006;
+  let closeReason = '';
+  let chunks = [];
+  let have = 0;
+  let need = 2;
+  let parts = [];
+
+  const send = (opcode, payload) => {
+    if (sock.destroyed || !sock.writable) return;
+    const len = payload.length;
+    const hl = len < 126 ? 2 : len < 65536 ? 4 : 10;
+    const out = Buffer.allocUnsafe(hl + 4 + len);
+    out[0] = 0x80 | opcode;
+    if (len < 126) out[1] = 0x80 | len;
+    else if (len < 65536) { out[1] = 0x80 | 126; out.writeUInt16BE(len, 2); }
+    else { out[1] = 0x80 | 127; out.writeBigUInt64BE(BigInt(len), 2); }
+    const mask = crypto.randomBytes(4);
+    mask.copy(out, hl);
+    for (let i = 0; i < len; i++) out[hl + 4 + i] = payload[i] ^ mask[i & 3];
+    sock.write(out);
+  };
+
+  const onFrame = (fin, opcode, payload) => {
+    if (opcode === 0x8) { // close
+      closeCode = payload.length >= 2 ? payload.readUInt16BE(0) : 1005;
+      closeReason = payload.subarray(2).toString('utf8');
+      if (!closing) { closing = true; send(0x8, payload.subarray(0, 2)); }
+      sock.end();
+    } else if (opcode === 0x9) send(0xA, payload); // ping -> pong
+    else if (opcode <= 0x2) { // continuation, text, binary
+      parts.push(payload);
+      if (fin) {
+        const msg = parts.length === 1 ? parts[0] : Buffer.concat(parts);
+        parts = [];
+        on.message(msg.toString('utf8'));
+      }
+    }
+  };
+
+  // Returns bytes used, or 0 (and sets `need`) when the frame is incomplete.
+  const parse = (buf) => {
+    if (buf.length < 2) { need = 2; return 0; }
+    let len = buf[1] & 0x7f;
+    let off = 2;
+    if (len === 126) { if (buf.length < 4) { need = 4; return 0; } len = buf.readUInt16BE(2); off = 4; }
+    else if (len === 127) { if (buf.length < 10) { need = 10; return 0; } len = Number(buf.readBigUInt64BE(2)); off = 10; }
+    const masked = buf[1] & 0x80;
+    const maskAt = off;
+    if (masked) off += 4;
+    if (buf.length < off + len) { need = off + len; return 0; }
+    let payload = buf.subarray(off, off + len);
+    if (masked) {
+      payload = Buffer.from(payload);
+      for (let i = 0; i < len; i++) payload[i] ^= buf[maskAt + (i & 3)];
+    }
+    onFrame(buf[0] & 0x80, buf[0] & 0x0f, payload);
+    return off + len;
+  };
+
+  const onData = (c) => {
+    if (c.length) { chunks.push(c); have += c.length; }
+    while (have >= need && !done) {
+      const buf = chunks.length === 1 ? chunks[0] : Buffer.concat(chunks, have);
+      const used = parse(buf);
+      if (!used) { chunks = [buf]; break; }
+      const rest = buf.subarray(used);
+      chunks = rest.length ? [rest] : [];
+      have = rest.length;
+      need = 2;
+    }
+  };
+
+  sock.on('connect', () => {
+    const h = host.includes(':') ? `[${host}]` : host;
+    sock.write(`GET / HTTP/1.1\r\nHost: ${h}:${port}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n` +
+      `Sec-WebSocket-Key: ${key}\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Protocol: ${protocol}\r\n\r\n`);
+  });
+  sock.on('data', (c) => {
+    if (upgraded) return onData(c);
+    head = Buffer.concat([head, c]);
+    const end = head.indexOf('\r\n\r\n');
+    if (end < 0) { if (head.length > 65536) sock.destroy(); return; }
+    const lines = head.subarray(0, end).toString('latin1').split('\r\n');
+    const accept = lines.find((l) => /^sec-websocket-accept:/i.test(l));
+    const expected = crypto.createHash('sha1').update(key + WS_GUID).digest('base64');
+    if (!/^HTTP\/1\.[01] 101/.test(lines[0]) || !accept || accept.slice(accept.indexOf(':') + 1).trim() !== expected) {
+      closeCode = 1002; closeReason = `not a websocket server (${lines[0]})`;
+      return sock.destroy();
+    }
+    upgraded = true;
+    const rest = head.subarray(end + 4);
+    head = null;
+    onData(rest);
+  });
+  sock.on('error', (e) => { if (!closeReason) closeReason = e.code || e.message; });
+  sock.on('close', () => { if (done) return; done = true; on.close(closeCode, closeReason); });
+
+  return {
+    send(text) { send(0x1, Buffer.from(text, 'utf8')); },
+    close() {
+      if (upgraded && !closing) { closing = true; send(0x8, Buffer.from([0x03, 0xe8])); }
+      sock.end();
+      setTimeout(() => sock.destroy(), 300).unref();
+    },
+  };
+}
+
 // ---------- connection ----------
 
 function readConfig() {
   try { return JSON.parse(fs.readFileSync(configPath(), 'utf8')); } catch { return {}; }
 }
 
-// null = can't tell
+// Only runs after a failed connection. null = can't tell.
 function obsProcessRunning() {
+  const { execFileSync } = require('node:child_process');
   try {
     if (process.platform === 'win32') {
       const out = execFileSync('tasklist', ['/FI', 'IMAGENAME eq obs64.exe', '/NH'], { encoding: 'utf8' });
@@ -105,10 +238,14 @@ function obsProcessRunning() {
 
 function sha256b64(s) { return crypto.createHash('sha256').update(s).digest('base64'); }
 
-function connect(flags) {
-  if (typeof WebSocket !== 'function') {
-    throw new CliError(`This needs Node >= 22 (global WebSocket). You have ${process.version}.`);
-  }
+function requestError(requestType, status) {
+  const e = new CliError(`${requestType} failed (code ${status.code})` + (status.comment ? `: ${status.comment}` : ''));
+  e.obsCode = status.code;
+  return e;
+}
+
+// opts.events: obs-websocket EventSubscription bitmask; opts.onEvent(type, data).
+function connect(flags, opts = {}) {
   const cfg = readConfig();
   const host = flags.host || process.env.OBS_HOST || '127.0.0.1';
   const port = flags.port || process.env.OBS_PORT || cfg.server_port || 4455;
@@ -116,31 +253,37 @@ function connect(flags) {
   const local = ['127.0.0.1', 'localhost', '::1'].includes(host);
 
   return new Promise((resolve, reject) => {
-    let ws;
-    try { ws = new WebSocket(`ws://${host.includes(':') ? `[${host}]` : host}:${port}`, 'obswebsocket.json'); }
-    catch (e) { return reject(new CliError(`Could not open the websocket: ${e.message}`)); }
-
     let identified = false;
     let settled = false;
     const pending = new Map();
     let seq = 0;
+    let onClosed = null;
+    let ws;
 
     const fail = (err) => {
       if (settled) return;
       settled = true; clearTimeout(timer);
-      try { ws.close(); } catch {}
+      ws.close();
       reject(err);
     };
     const timer = setTimeout(() => {
       const e = new CliError(`OBS did not finish the handshake at ${host}:${port}.`); e.notRunning = true; fail(e);
     }, TIMEOUT_MS);
 
-    ws.addEventListener('message', (ev) => {
+    const track = (requestId, label, ms, res, rej) => {
+      const t = setTimeout(() => {
+        pending.delete(requestId);
+        rej(new CliError(`OBS did not answer ${label} in time.`));
+      }, ms);
+      pending.set(requestId, { res, rej, t, label });
+    };
+
+    const onMessage = (text) => {
       let msg;
-      try { msg = JSON.parse(ev.data); } catch { return; }
+      try { msg = JSON.parse(text); } catch { return; }
       const { op, d } = msg;
       if (op === 0) { // Hello
-        const identify = { rpcVersion: 1, eventSubscriptions: 0 };
+        const identify = { rpcVersion: 1, eventSubscriptions: opts.events || 0 };
         if (d.authentication) {
           if (!password) {
             return fail(new CliError('OBS requires a websocket password and none was found ' +
@@ -156,41 +299,45 @@ function connect(flags) {
           call(requestType, requestData) {
             const requestId = String(++seq);
             ws.send(JSON.stringify({ op: 6, d: { requestType, requestId, requestData } }));
-            return new Promise((res, rej) => {
-              const t = setTimeout(() => {
-                pending.delete(requestId);
-                rej(new CliError(`OBS did not answer ${requestType} in time.`));
-              }, TIMEOUT_MS);
-              pending.set(requestId, { res, rej, t, requestType });
-            });
+            return new Promise((res, rej) => track(requestId, requestType, TIMEOUT_MS, res, rej));
           },
-          close() { try { ws.close(); } catch {} },
+          // One round trip, executed in order; stops at the first failure.
+          batch(requests, ms = TIMEOUT_MS) {
+            const requestId = `b${++seq}`;
+            ws.send(JSON.stringify({ op: 8, d: { requestId, haltOnFailure: true, executionType: 0, requests } }));
+            return new Promise((res, rej) => track(requestId, 'RequestBatch', ms, res, rej));
+          },
+          closed: new Promise((res) => { onClosed = res; }),
+          close() { ws.close(); },
         });
       } else if (op === 7) { // RequestResponse
         const p = pending.get(d.requestId);
         if (!p) return;
         pending.delete(d.requestId); clearTimeout(p.t);
         if (d.requestStatus.result) p.res(d.responseData || {});
-        else {
-          const e = new CliError(`${p.requestType} failed (code ${d.requestStatus.code})` +
-            (d.requestStatus.comment ? `: ${d.requestStatus.comment}` : ''));
-          e.obsCode = d.requestStatus.code;
-          p.rej(e);
-        }
+        else p.rej(requestError(p.label, d.requestStatus));
+      } else if (op === 9) { // RequestBatchResponse
+        const p = pending.get(d.requestId);
+        if (!p) return;
+        pending.delete(d.requestId); clearTimeout(p.t);
+        p.res(d.results || []);
+      } else if (op === 5 && opts.onEvent) { // Event
+        opts.onEvent(d.eventType, d.eventData || {});
       }
-    });
+    };
 
-    ws.addEventListener('close', (ev) => {
+    const onClose = (code, reason) => {
       for (const p of pending.values()) { clearTimeout(p.t); p.rej(new CliError('Lost the connection to OBS.')); }
       pending.clear();
-      if (identified) return;
-      if (ev.code === 4009) {
+      if (identified) { if (onClosed) onClosed({ code, reason }); return; }
+      if (code === 4009) {
         return fail(new CliError('OBS rejected the websocket password (authentication failed). ' +
           'Check --password / OBS_PASSWORD or OBS → Tools → WebSocket Server Settings.'));
       }
-      if (ev.code >= 4000) {
-        return fail(new CliError(`OBS closed the connection (code ${ev.code}${ev.reason ? `: ${ev.reason}` : ''}).`));
+      if (code >= 4000) {
+        return fail(new CliError(`OBS closed the connection (code ${code}${reason ? `: ${reason}` : ''}).`));
       }
+      if (code === 1002) return fail(new CliError(`${host}:${port} is ${reason}.`));
       const running = local ? obsProcessRunning() : null;
       if (running === false) {
         const e = new CliError('OBS is not running.'); e.notRunning = true; return fail(e);
@@ -203,8 +350,9 @@ function connect(flags) {
       const e = new CliError(`Could not reach OBS at ${host}:${port}. Is it running with the websocket server enabled?`);
       e.notRunning = true;
       fail(e);
-    });
-    ws.addEventListener('error', () => { /* close carries the details */ });
+    };
+
+    ws = openSocket(host, port, 'obswebsocket.json', { message: onMessage, close: onClose });
   });
 }
 
@@ -214,6 +362,7 @@ function fmtDb(db) { return db === -Infinity || db < -100 ? '-inf dB' : `${db.to
 
 // Exact match, then case-insensitive, then unique substring.
 function pickName(wanted, names, what) {
+  wanted = String(wanted);
   if (names.includes(wanted)) return wanted;
   const low = wanted.toLowerCase();
   const ci = names.filter((n) => n.toLowerCase() === low);
@@ -244,14 +393,17 @@ async function resolveInput(obs, wanted) {
   return pickName(wanted, await inputNames(obs), 'inputs');
 }
 
-// Finds a source in a scene, including inside its groups.
-async function findSceneItem(obs, sceneName, wanted) {
+// Every item in a scene, including the ones inside its groups.
+async function sceneItemsDeep(obs, sceneName) {
   const { sceneItems } = await obs.call('GetSceneItemList', { sceneName });
   const found = sceneItems.map((item) => ({ sceneName, item }));
-  for (const g of sceneItems.filter((i) => i.isGroup)) {
-    const r = await obs.call('GetGroupSceneItemList', { sceneName: g.sourceName });
-    for (const item of r.sceneItems) found.push({ sceneName: g.sourceName, item });
-  }
+  const groups = await Promise.all(sceneItems.filter((i) => i.isGroup)
+    .map((g) => obs.call('GetGroupSceneItemList', { sceneName: g.sourceName }).then((r) => [g.sourceName, r])));
+  for (const [group, r] of groups) for (const item of r.sceneItems) found.push({ sceneName: group, item });
+  return found;
+}
+
+function pickItem(found, wanted, sceneName) {
   const name = pickName(wanted, [...new Set(found.map((f) => f.item.sourceName))], `sources in "${sceneName}"`);
   return found.find((f) => f.item.sourceName === name);
 }
@@ -260,11 +412,11 @@ async function findSceneItem(obs, sceneName, wanted) {
 // current program scene, else OBS's global Mic/Aux, else the first audio input capture.
 async function findMic(obs) {
   if (process.env.OBS_MIC) return resolveInput(obs, process.env.OBS_MIC);
-  const { inputs } = await obs.call('GetInputList');
+  const [{ inputs }, cur] = await Promise.all([
+    obs.call('GetInputList'), obs.call('GetCurrentProgramScene').catch(() => null)]);
   const captures = inputs.filter((i) => /input_capture/.test(i.inputKind || '')).map((i) => i.inputName);
   try {
-    const { currentProgramSceneName } = await obs.call('GetCurrentProgramScene');
-    const { sceneItems } = await obs.call('GetSceneItemList', { sceneName: currentProgramSceneName });
+    const { sceneItems } = await obs.call('GetSceneItemList', { sceneName: cur.currentProgramSceneName });
     const inScene = sceneItems.map((i) => i.sourceName).find((n) => captures.includes(n));
     if (inScene) return inScene;
   } catch { /* fall through */ }
@@ -283,16 +435,263 @@ function screenshotDir() {
   return process.env.OBS_SCREENSHOT_DIR || path.join(os.tmpdir(), 'obscom-screenshots');
 }
 
+function parseDb(db) {
+  const n = Number(String(db).replace(/\s*db$/i, ''));
+  if (String(db).trim() === '' || !Number.isFinite(n) || n > 26 || n < -100) {
+    throw new CliError('Volume is in dB, between -100 and 26 (e.g. -6).');
+  }
+  return n;
+}
+
+const STREAM_REQUESTS = ['StartStream', 'StopStream', 'ToggleStream'];
+
+// ---------- macros ----------
+
+function macroPaths(flags) {
+  if (flags.macros) return [path.resolve(flags.macros)];
+  if (process.env.OBSCOM_MACROS) return [path.resolve(process.env.OBSCOM_MACROS)];
+  return defaultMacroPaths();
+}
+
+function defaultMacroPaths() {
+  const home = os.homedir();
+  const list = [
+    path.resolve('obscom.json'),
+    path.join(process.env.XDG_CONFIG_HOME || path.join(home, '.config'), 'obscom', 'macros.json'),
+  ];
+  if (process.platform === 'darwin') list.push(path.join(home, 'Library', 'Application Support', 'obscom', 'macros.json'));
+  if (process.platform === 'win32') {
+    list.push(path.join(process.env.APPDATA || path.join(home, 'AppData', 'Roaming'), 'obscom', 'macros.json'));
+  }
+  return list;
+}
+
+function loadMacros(flags) {
+  const paths = macroPaths(flags);
+  const explicit = Boolean(flags.macros || process.env.OBSCOM_MACROS);
+  for (const file of paths) {
+    let src;
+    try { src = fs.readFileSync(file, 'utf8'); } catch (e) {
+      if (e.code === 'ENOENT' && !explicit) continue;
+      throw new CliError(`Could not read macros file ${file}: ${e.code || e.message}`);
+    }
+    let all;
+    try { all = JSON.parse(src); } catch (e) { throw new CliError(`${file} is not valid JSON: ${e.message}`); }
+    if (!all || typeof all !== 'object' || Array.isArray(all)) {
+      throw new CliError(`${file} must be a JSON object of {"macroName": [steps]}.`);
+    }
+    // Keys starting with "_" are comments.
+    const macros = Object.fromEntries(Object.entries(all).filter(([k]) => !k.startsWith('_')));
+    return { file, macros };
+  }
+  throw new CliError(`No macros file. Looked in: ${paths.join(', ')}`);
+}
+
+function findMacro(macros, wanted) {
+  const names = Object.keys(macros);
+  if (names.includes(wanted)) return wanted;
+  const ci = names.filter((n) => n.toLowerCase() === String(wanted).toLowerCase());
+  if (ci.length === 1) return ci[0];
+  throw new CliError(`Unknown macro "${wanted}". Available: ${names.join(', ') || '(none)'}`);
+}
+
+const VERBS = ['scene', 'show', 'hide', 'mute', 'unmute', 'volume', 'text', 'record', 'stream', 'sleep', 'macro', 'raw'];
+
+function parseStep(raw, where) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    throw new CliError(`${where}: a step is an object like {"scene":"Main"}.`);
+  }
+  const keys = Object.keys(raw).filter((k) => k !== 'confirm');
+  if (keys.length !== 1 || !VERBS.includes(keys[0])) {
+    throw new CliError(`${where}: expected exactly one of ${VERBS.join(', ')} (got ${keys.join(', ') || 'nothing'}).`);
+  }
+  return { verb: keys[0], value: raw[keys[0]], confirm: raw.confirm === true };
+}
+
+// {1}, {2}... = positional args; {*} = all args joined by spaces.
+function fill(v, args, where) {
+  if (typeof v === 'string') {
+    return v.replace(/\{(\d+|\*)\}/g, (_, k) => {
+      if (k === '*') return args.join(' ');
+      const a = args[Number(k) - 1];
+      if (a === undefined) throw new CliError(`${where} needs argument {${k}}.`);
+      return a;
+    });
+  }
+  if (Array.isArray(v)) return v.map((x) => fill(x, args, where));
+  if (v && typeof v === 'object') return Object.fromEntries(Object.entries(v).map(([k, x]) => [k, fill(x, args, where)]));
+  return v;
+}
+
+// Flattens a macro (and the macros it calls) into a list of steps with args filled in.
+function expandMacro(macros, name, args, stack = []) {
+  const chain = [...stack, name];
+  if (stack.includes(name)) throw new CliError(`Macro recursion: ${chain.join(' > ')}`);
+  if (chain.length > 16) throw new CliError(`Macros nested too deep: ${chain.join(' > ')}`);
+  const steps = macros[name];
+  if (!Array.isArray(steps)) throw new CliError(`Macro "${name}" must be a list of steps.`);
+  const out = [];
+  steps.forEach((raw, i) => {
+    const where = `${chain.join(' > ')} step ${i + 1}`;
+    const step = parseStep(raw, where);
+    const value = fill(step.value, args, where);
+    if (step.verb === 'macro') {
+      const [sub, ...subArgs] = Array.isArray(value) ? value.map(String) : [String(value)];
+      // A call without args passes the caller's args through.
+      out.push(...expandMacro(macros, findMacro(macros, sub), Array.isArray(value) ? subArgs : args, chain));
+    } else out.push({ ...step, value, where });
+  });
+  if (out.length > 500) throw new CliError(`Macro "${name}" expands to more than 500 steps.`);
+  return out;
+}
+
+const isDefaultInput = (v) => v === true || v === null || v === undefined || v === '' ||
+  (Array.isArray(v) && (v.length === 0 || isDefaultInput(v[0])));
+const first = (v) => (Array.isArray(v) ? v[0] : v);
+
+function short(s, n = 40) { s = String(s).replace(/\n/g, '\\n'); return s.length > n ? `${s.slice(0, n - 1)}…` : s; }
+
+// Unresolved, for `obscom macros`.
+function describeStep({ verb, value }) {
+  if (verb === 'raw') return `raw ${typeof value === 'string' ? value : first(value)?.requestType || first(value)}`;
+  if (verb === 'mute' || verb === 'unmute') return isDefaultInput(value) ? `${verb} mic` : `${verb} ${first(value)}`;
+  if (verb === 'text' && Array.isArray(value)) return `text ${value[0]}="${short(value.slice(1).join(' '), 24)}"`;
+  if ((verb === 'show' || verb === 'hide') && Array.isArray(value) && value[1]) return `${verb} ${value[0]} (in ${value[1]})`;
+  if (Array.isArray(value)) return `${verb} ${value.join(' ')}`;
+  return `${verb} ${value}`;
+}
+
+// Resolves names against OBS and turns steps into obs-websocket requests.
+async function planMacro(obs, steps, flags) {
+  const memo = new Map();
+  const once = (k, f) => { if (!memo.has(k)) memo.set(k, f()); return memo.get(k); };
+  const scenes = () => once('scenes', () => sceneNames(obs));
+  const inputs = () => once('inputs', () => obs.call('GetInputList').then((r) => r.inputs));
+  const mic = () => once('mic', () => findMic(obs));
+  const items = (scene) => once(`items:${scene}`, () => sceneItemsDeep(obs, scene));
+
+  // Fetch what the steps need, in parallel, before resolving.
+  const has = (...v) => steps.some((s) => v.includes(s.verb));
+  await Promise.all([
+    has('scene', 'show', 'hide') && scenes(),
+    has('mute', 'unmute', 'volume', 'text') && inputs(),
+    steps.some((s) => (s.verb === 'mute' || s.verb === 'unmute') && isDefaultInput(s.value)) && mic(),
+  ]);
+
+  const requests = [];
+  const labels = [];
+  let sleepMs = 0;
+  let sceneSoFar = null; // the scene the macro switched to, used by show/hide without a scene
+  const add = (requestType, requestData, label) => {
+    requests.push(requestData ? { requestType, requestData } : { requestType });
+    labels.push(label);
+  };
+  const guardStream = (s, what) => {
+    if (!s.confirm || !flags.yes) {
+      throw new CliError(`${s.where}: ${what} inside a macro needs "confirm": true in the step and --yes on the command.`);
+    }
+  };
+
+  for (const s of steps) {
+    const v = s.value;
+    try {
+      switch (s.verb) {
+        case 'scene': {
+          if (!first(v)) throw new CliError('needs a scene name.');
+          const sceneName = pickName(first(v), (await scenes()).list, 'scenes');
+          sceneSoFar = sceneName;
+          add('SetCurrentProgramScene', { sceneName }, `scene ${sceneName}`);
+          break;
+        }
+        case 'show':
+        case 'hide': {
+          const [src, sc] = Array.isArray(v) ? v : [v];
+          if (!src) throw new CliError('needs a source name.');
+          const { list, current } = await scenes();
+          const sceneName = sc ? pickName(sc, list, 'scenes') : (sceneSoFar || current);
+          const { sceneName: where, item } = pickItem(await items(sceneName), src, sceneName);
+          add('SetSceneItemEnabled', { sceneName: where, sceneItemId: item.sceneItemId, sceneItemEnabled: s.verb === 'show' },
+            `${s.verb} ${item.sourceName}`);
+          break;
+        }
+        case 'mute':
+        case 'unmute': {
+          let inputName;
+          if (isDefaultInput(v)) {
+            inputName = await mic();
+            if (!inputName) throw new CliError('no mic found. Name the input or set OBS_MIC.');
+          } else inputName = pickName(first(v), (await inputs()).map((i) => i.inputName), 'inputs');
+          add('SetInputMute', { inputName, inputMuted: s.verb === 'mute' }, `${s.verb} ${inputName}`);
+          break;
+        }
+        case 'volume': {
+          if (!Array.isArray(v) || v.length !== 2) throw new CliError('volume is ["<input>", dB].');
+          const inputName = pickName(v[0], (await inputs()).map((i) => i.inputName), 'inputs');
+          const db = parseDb(v[1]);
+          add('SetInputVolume', { inputName, inputVolumeDb: db }, `volume ${inputName} ${db}dB`);
+          break;
+        }
+        case 'text': {
+          if (!Array.isArray(v) || v.length < 2) throw new CliError('text is ["<source>", "<text>"].');
+          const all = await inputs();
+          const inputName = pickName(v[0], all.map((i) => i.inputName), 'inputs');
+          const kind = all.find((i) => i.inputName === inputName).inputKind;
+          if (!/^text_/.test(kind)) throw new CliError(`"${inputName}" is not a text source (it is ${kind}).`);
+          const text = v.slice(1).join(' ').replace(/\\n/g, '\n');
+          add('SetInputSettings', { inputName, inputSettings: { text }, overlay: true }, `text ${inputName}="${short(text)}"`);
+          break;
+        }
+        case 'record': {
+          if (v !== 'start' && v !== 'stop') throw new CliError('record is "start" or "stop".');
+          add(v === 'start' ? 'StartRecord' : 'StopRecord', null, `record ${v}`);
+          break;
+        }
+        case 'stream': {
+          if (v !== 'start' && v !== 'stop') throw new CliError('stream is "start" or "stop".');
+          guardStream(s, `stream ${v}`);
+          add(v === 'start' ? 'StartStream' : 'StopStream', null, `stream ${v}`);
+          break;
+        }
+        case 'sleep': {
+          const ms = Number(v);
+          if (!Number.isInteger(ms) || ms < 0 || ms > 50000) throw new CliError('sleep is milliseconds, 0 to 50000.');
+          sleepMs += ms;
+          add('Sleep', { sleepMillis: ms }, `sleep ${ms}ms`);
+          break;
+        }
+        case 'raw': {
+          let requestType;
+          let requestData;
+          if (typeof v === 'string') requestType = v;
+          else if (Array.isArray(v)) [requestType, requestData] = v;
+          else if (v && typeof v === 'object') ({ requestType, requestData } = v);
+          if (typeof requestType !== 'string' || !requestType) {
+            throw new CliError('raw is "<RequestType>" or ["<RequestType>", {data}].');
+          }
+          if (STREAM_REQUESTS.includes(requestType)) guardStream(s, requestType);
+          if (requestType === 'Sleep') sleepMs += Number(requestData && requestData.sleepMillis) || 0;
+          add(requestType, requestData || null, `raw ${requestType}`);
+          break;
+        }
+      }
+    } catch (e) {
+      if (e instanceof CliError && !e.message.startsWith(s.where)) e.message = `${s.where}: ${e.message}`;
+      throw e;
+    }
+  }
+  return { requests, labels, sleepMs };
+}
+
 // ---------- commands ----------
 
 const commands = {
-  async status(obs) {
-    const [ver, scene, stream, rec] = await Promise.all([
+  async status(obs, args, flags) {
+    const [ver, scene, stream, rec, micName] = await Promise.all([
       obs.call('GetVersion'), obs.call('GetCurrentProgramScene'),
       obs.call('GetStreamStatus'), obs.call('GetRecordStatus'),
+      findMic(obs).catch(() => null),
     ]);
     let mic = null;
-    const micName = await findMic(obs).catch(() => null);
     if (micName) {
       const [m, v] = await Promise.all([
         obs.call('GetInputMute', { inputName: micName }),
@@ -307,6 +706,15 @@ const commands = {
       recording: rec.outputActive, recordPaused: rec.outputPaused, recordTimecode: tc(rec),
       mic,
     };
+    if (flags.short) {
+      const text = [
+        data.streaming ? `LIVE ${data.streamTimecode}${data.streamReconnecting ? ' (reconnecting)' : ''}` : 'offline',
+        data.scene,
+        data.recording ? `rec ${data.recordPaused ? 'paused ' : ''}${data.recordTimecode}` : 'rec off',
+        mic ? `mic ${mic.muted ? 'off' : 'on'}` : 'mic ?',
+      ].join(' · ');
+      return { data, text };
+    }
     const text = [
       `OBS ${data.obsVersion} running (websocket ${data.websocketVersion})`,
       `Scene:     ${data.scene}`,
@@ -360,11 +768,7 @@ const commands = {
   async volume(obs, [input, db]) {
     if (!input) throw new CliError('Usage: obscom volume "<input>" [dB]');
     const inputName = await resolveInput(obs, input);
-    if (db !== undefined) {
-      const n = Number(String(db).replace(/db$/i, ''));
-      if (!Number.isFinite(n) || n > 26 || n < -100) throw new CliError('Volume is in dB, between -100 and 26 (e.g. -6).');
-      await obs.call('SetInputVolume', { inputName, inputVolumeDb: n });
-    }
+    if (db !== undefined) await obs.call('SetInputVolume', { inputName, inputVolumeDb: parseDb(db) });
     const v = await obs.call('GetInputVolume', { inputName });
     return { data: { input: inputName, volumeDb: v.inputVolumeDb, volumeMul: v.inputVolumeMul },
       text: `${inputName}: ${fmtDb(v.inputVolumeDb)}` };
@@ -446,8 +850,11 @@ const commands = {
     return { data: { source: sourceName, path: out, bytes: buf.length }, text: out };
   },
 
-  async raw(obs, [requestType, json]) {
+  async raw(obs, [requestType, json], flags) {
     if (!requestType) throw new CliError("Usage: obscom raw <RequestType> ['<json>']");
+    if (STREAM_REQUESTS.includes(requestType) && !flags.yes) {
+      throw new CliError(`${requestType} is public. Repeat it with --yes to confirm.`);
+    }
     let requestData;
     if (json) {
       try { requestData = JSON.parse(json); } catch (e) { throw new CliError(`Invalid JSON: ${e.message}`); }
@@ -455,26 +862,90 @@ const commands = {
     const r = await obs.call(requestType, requestData);
     return { data: { response: r }, text: JSON.stringify(r, null, 2) };
   },
+
+  // `pre` is the expanded macro, built before connecting.
+  async run(obs, args, flags, pre) {
+    const { name, steps } = pre;
+    const { requests, labels, sleepMs } = await planMacro(obs, steps, flags);
+    if (flags.dryRun) {
+      return { data: { macro: name, dryRun: true, requests },
+        text: `dry ${name}: ${labels.join(' · ') || '(no steps)'}` };
+    }
+    if (requests.length) {
+      const results = await obs.batch(requests, TIMEOUT_MS + sleepMs);
+      const bad = results.findIndex((r) => !r.requestStatus.result);
+      if (bad >= 0 || results.length < requests.length) {
+        const i = bad >= 0 ? bad : results.length;
+        const st = bad >= 0 ? results[bad].requestStatus : { code: 0, comment: 'no response' };
+        const e = new CliError(`${name}: step ${i + 1}/${requests.length} (${labels[i]}) failed (code ${st.code})` +
+          `${st.comment ? `: ${String(st.comment).replace(/\.+$/, '')}` : ''}. ${i} of ${requests.length} step(s) ran.`);
+        e.obsCode = st.code;
+        throw e;
+      }
+    }
+    const ms = Math.round(performance.now());
+    return { data: { macro: name, steps: requests.length, ms }, text: `ok ${name} ${ms}ms` };
+  },
+
+  async watch(obs, args, flags, pre) {
+    const out = (s) => process.stdout.write(`${s}\n`);
+    let chain = Promise.resolve();
+    let exiting = false;
+    pre.handler = (type, d) => {
+      if (type === 'ExitStarted') exiting = true;
+      if (!flags.all && !WATCHED.has(type)) return;
+      // Keep output in event order even when a lookup is needed.
+      chain = chain.then(async () => {
+        if (type === 'SceneItemEnableStateChanged') {
+          d.sourceName = await obs.call('GetSceneItemSource', { sceneName: d.sceneName, sceneItemId: d.sceneItemId })
+            .then((r) => r.sourceName).catch(() => null);
+        }
+        const data = Object.fromEntries(Object.entries(d).filter(([k]) => !/Uuid$/.test(k)));
+        out(flags.json ? JSON.stringify({ event: type, ts: Date.now(), ...data }) : eventLine(type, data));
+      }).catch(() => {});
+    };
+    const { code } = await obs.closed;
+    await chain;
+    if (!exiting) {
+      const e = new CliError(`Lost the connection to OBS (code ${code}).`); e.notRunning = true; throw e;
+    }
+    return null;
+  },
 };
+
+const WATCHED = new Set(['CurrentProgramSceneChanged', 'StreamStateChanged', 'RecordStateChanged',
+  'InputMuteStateChanged', 'SceneItemEnableStateChanged', 'ExitStarted']);
+const state = (s) => String(s || '').replace(/^OBS_WEBSOCKET_OUTPUT_/, '');
+
+function eventLine(type, d) {
+  switch (type) {
+    case 'CurrentProgramSceneChanged': return `scene ${d.sceneName}`;
+    case 'StreamStateChanged': return `stream ${state(d.outputState)}`;
+    case 'RecordStateChanged': return `record ${state(d.outputState)}${d.outputPath ? ` ${d.outputPath}` : ''}`;
+    case 'InputMuteStateChanged': return `${d.inputMuted ? 'mute' : 'unmute'} ${d.inputName}`;
+    case 'SceneItemEnableStateChanged':
+      return `${d.sceneItemEnabled ? 'show' : 'hide'} ${d.sourceName ?? `#${d.sceneItemId}`} (${d.sceneName})`;
+    case 'ExitStarted': return 'exit';
+    default: return `${type} ${JSON.stringify(d)}`;
+  }
+}
 
 async function setVisible(obs, [source, scene], enabled) {
   if (!source) throw new CliError(`Usage: obscom ${enabled ? 'show' : 'hide'} "<source>" [scene]`);
   const sceneName = await resolveScene(obs, scene);
-  const { sceneName: where, item } = await findSceneItem(obs, sceneName, source);
+  const { sceneName: where, item } = pickItem(await sceneItemsDeep(obs, sceneName), source, sceneName);
   await obs.call('SetSceneItemEnabled', { sceneName: where, sceneItemId: item.sceneItemId, sceneItemEnabled: enabled });
   return { data: { scene: where, source: item.sourceName, visible: enabled, previous: item.sceneItemEnabled },
     text: `${item.sourceName} (${where}): ${enabled ? 'visible' : 'hidden'}` };
 }
 
 async function setMute(obs, input, muted) {
-  const fallback = input ? null : await findMic(obs);
-  if (!input && !fallback) throw new CliError('No mic found. Name the input or set OBS_MIC.');
-  const inputName = input ? await resolveInput(obs, input) : fallback;
+  const inputName = input ? await resolveInput(obs, input) : await findMic(obs);
+  if (!inputName) throw new CliError('No mic found. Name the input or set OBS_MIC.');
   const before = await obs.call('GetInputMute', { inputName });
   await obs.call('SetInputMute', { inputName, inputMuted: muted });
-  const r = await obs.call('GetInputMute', { inputName });
-  return { data: { input: inputName, muted: r.inputMuted, previous: before.inputMuted },
-    text: `${inputName}: ${r.inputMuted ? 'MUTED' : 'live'}` };
+  return { data: { input: inputName, muted, previous: before.inputMuted },
+    text: `${inputName}: ${muted ? 'MUTED' : 'live'}` };
 }
 
 // ---------- main ----------
@@ -482,44 +953,78 @@ async function setMute(obs, input, muted) {
 const ALIASES = {
   estado: 'status', escenas: 'scenes', escena: 'scene', fuentes: 'sources',
   mostrar: 'show', ocultar: 'hide', volumen: 'volume', texto: 'text',
-  grabar: 'record', captura: 'screenshot', ayuda: 'help',
+  grabar: 'record', captura: 'screenshot', correr: 'run', ayuda: 'help',
 };
+
+// General | Scenes | Inputs | Outputs | SceneItems; --all = every low-volume category.
+const WATCH_EVENTS = 1 | 4 | 8 | 64 | 128;
+const ALL_EVENTS = 2047;
+
+function print(flags, data, text) {
+  if (flags.quiet) return;
+  console.log(flags.json ? JSON.stringify({ ok: true, ...data }) : text);
+}
 
 async function main() {
   const { flags, pos } = parseArgs(process.argv.slice(2));
   const cmd = ALIASES[pos[0]] || pos[0] || 'help';
   if (cmd === 'help') { console.log(HELP); return; }
   if (cmd === 'version') { console.log(VERSION); return; }
+
+  // Commands that need the macros file read and checked before touching OBS.
+  let pre = {};
+  if (cmd === 'macros' || (cmd === 'run' && !pos[1])) {
+    const { file, macros } = loadMacros(flags);
+    const list = Object.entries(macros).map(([name, steps]) => ({
+      name,
+      steps: Array.isArray(steps)
+        ? steps.map((s, i) => { try { return describeStep(parseStep(s, '')); } catch { return `(bad step ${i + 1})`; } })
+        : ['(not a list of steps)'],
+    }));
+    print(flags, { file, macros: list.map((m) => m.name) },
+      list.map((m) => `${m.name}: ${m.steps.join(' · ')}`).join('\n') || '(no macros)');
+    return;
+  }
+  if (cmd === 'run') {
+    const { macros } = loadMacros(flags);
+    const name = findMacro(macros, pos[1]);
+    pre = { name, steps: expandMacro(macros, name, pos.slice(2)) };
+  }
+
   const fn = commands[cmd];
   if (!fn) throw new CliError(`Unknown command "${pos[0]}". Try: obscom help`);
 
   let obs;
   try {
-    obs = await connect(flags);
+    obs = await connect(flags, cmd === 'watch'
+      ? { events: flags.all ? ALL_EVENTS : WATCH_EVENTS, onEvent: (t, d) => pre.handler && pre.handler(t, d) }
+      : {});
   } catch (e) {
     // For `status`, OBS being closed is the answer, not an error.
     if (cmd === 'status' && e.notRunning) {
       if (flags.json) console.log(JSON.stringify({ ok: true, running: false, error: e.message }));
-      else console.log(e.message);
+      else if (!flags.quiet) console.log(!flags.short ? e.message : /not running/.test(e.message) ? 'OBS not running' : 'OBS unreachable');
       process.exitCode = 3;
       return;
     }
     throw e;
   }
+  if (cmd === 'watch') process.stdout.on('error', () => process.exit(0)); // reader went away
   try {
-    const { data, text } = await fn(obs, pos.slice(1), flags);
-    console.log(flags.json ? JSON.stringify({ ok: true, ...data }) : text);
+    const res = await fn(obs, pos.slice(1), flags, pre);
+    if (res) print(flags, res.data, res.text);
   } finally {
     obs.close();
   }
 }
 
 main().catch((e) => {
-  const msg = e instanceof CliError ? e.message : `Unexpected error: ${(e && e.stack) || e}`;
+  const msg = e instanceof CliError ? e.message
+    : `Unexpected error: ${process.env.OBSCOM_DEBUG ? (e && e.stack) : (e && e.message) || e}`;
   if (process.argv.includes('--json')) {
     console.log(JSON.stringify({ ok: false, error: msg, ...(e.obsCode ? { code: e.obsCode } : {}) }));
   } else {
-    console.error(`obscom: ${msg}`);
+    console.error(`obscom: ${msg.replace(/\n/g, ' ')}`);
   }
   process.exitCode = e.notRunning ? 3 : 1;
 });
